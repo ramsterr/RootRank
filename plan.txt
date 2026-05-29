@@ -1,0 +1,723 @@
+# Project 2: MicroRank Root Cause Engine — Build Reference
+
+> This document is the canonical reference for building the MicroRank spectrum scoring and Personalized PageRank ranking library. It is a standalone, shippable project that contributes to Phase 1b of the SRE Root Cause Analysis Tool. Use this as the source of truth when prompting for implementation help. This project merges and enhances subprojects #4 (Spectrum Scorer Library) and #5 (Root Cause Ranker) into one unified engine.
+
+---
+
+## Meta-Structure: How to Read This Document
+
+This project contains these sections:
+
+- **Real Objective** — What you are *actually* trying to accomplish, stated in plain English.
+- **Tool Objective** — What the software must do at the end. This is the acceptance test.
+- **What You Must Understand Before Coding** — Concepts, their internals, and why they matter.
+- **What to Study and Where** — Specific resources, specific sections, specific things to extract.
+- **What to Code** — Each component, its purpose, inputs, outputs, internals, and verification.
+- **How the Pieces Connect** — Data flow showing how components connect.
+- **Understanding Checkpoints** — Concrete things you should be able to explain before moving on.
+- **Common Mistakes** — What people get wrong and how to avoid it.
+- **Ship Criteria** — What makes this project ready to publish and share.
+
+---
+
+## Real Objective
+
+You are building a pure Python library that implements MicroRank's two-stage root cause analysis algorithm. Stage 1: spectrum-based fault localization using the Ochiai coefficient (and alternatives) to score how suspicious each service is. Stage 2: graph-based ranking (Personalized PageRank or upstream anomaly propagation) that refines those scores using the dependency graph structure — ensuring that an upstream service whose failure propagates to many downstream services ranks above those downstream victims.
+
+Think of it like a detective and a judge working together. The detective (spectrum scorer) says "service X appears in 95% of the bad traces and only 5% of the good ones — very suspicious." The judge (PageRank) says "but service X is downstream of service Y, and Y's anomaly started first — Y is the real root cause, X is just a victim." The library has no dependencies on Kubernetes, Jaeger, or Prometheus — it works on any graph where you have nodes with pass/fail observations.
+
+## Tool Objective
+
+By the end of this project, the library must:
+1. Accept a list of executions (each with involved components and a pass/fail label) and compute suspiciousness scores
+2. Implement four spectrum scoring formulas: Ochiai, Tarantula, Jaccard, DStar
+3. Accept a directed weighted graph and anomaly scores, and run Personalized PageRank
+4. Implement five ranking algorithms: Personalized PageRank, Upstream Propagation, standard PageRank, Betweenness Centrality, Anomaly-Only
+5. Provide a `compare` command that runs all formula × algorithm combinations
+6. Return ranked lists with scores
+7. Be installable via pip with a clean, well-documented API
+8. Include comprehensive tests with known inputs and expected outputs
+
+## What You Must Understand Before Coding
+
+### Concept 1: The Ochiai Coefficient (and Why It Works)
+
+The Ochiai coefficient for a component `s` is:
+
+$$Ochiai(s) = \frac{n_{ef}}{\sqrt{n_f \cdot n_e}}$$
+
+Where:
+- `n_ef` = number of **failing** executions that contain component `s`
+- `n_f` = total number of failing executions (regardless of which components they contain)
+- `n_e` = total number of executions (passing + failing) that contain component `s`
+
+**Interpretation:**
+- Score ≈ 1.0: component appears in nearly all failing executions and very few passing ones → very likely the root cause
+- Score ≈ 0.0: component appears in few failing executions or many passing ones → unlikely the root cause
+- Score ≈ 0.5: ambiguous — could be a victim downstream of the real root cause
+
+**Why Ochiai beats simpler approaches:** If you just counted "how many failing executions contain this service?", the frontend would always rank #1 (it's in every execution). The Ochiai denominator normalizes for how often the service appears in general, so a service that's in all executions gets penalized.
+
+**Walk-through with numbers:**
+100 executions total. 20 failing, 80 passing.
+
+Component `inventory-service` appears in 19 failing and 5 passing:
+`Ochiai = 19 / sqrt(20 × 24) = 19 / 21.9 = 0.868`
+
+Component `frontend` appears in 20 failing and 80 passing (it's in every execution):
+`Ochiai = 20 / sqrt(20 × 100) = 20 / 44.7 = 0.447`
+
+The frontend has a lower score because it appears in ALL executions — no discriminating power.
+
+**Self-check:** 50 failing, 100 passing. Component X appears in 45 failing and 10 passing. Component Y appears in 50 failing and 100 passing. Which has a higher Ochiai score? Answer: X = 45/sqrt(50×55) = 45/52.4 = 0.859. Y = 50/sqrt(50×150) = 50/86.6 = 0.577. X wins.
+
+### Concept 2: Three Alternative SBFL Formulas
+
+MicroRank uses Ochiai, but your library should support four formulas for comparison:
+
+**Tarantula:**
+$$Tarantula(s) = \frac{n_{ef}/n_f}{n_{ef}/n_f + n_{ep}/n_p}$$
+Where `n_ep` = passing executions containing component, `n_p` = total passing. Denominator can be 0 — handle this edge case by returning 0.
+
+**Jaccard:**
+$$Jaccard(s) = \frac{n_{ef}}{n_f + n_{ep}}$$
+
+**DStar (λ = 2):**
+$$DStar(s) = \frac{n_{ef}^2}{n_{ep} + n_{nf}}$$
+Where `n_nf` = failing executions NOT containing component (i.e., `n_f - n_ef`).
+
+**Why support multiple formulas?** Different failure patterns favor different formulas. Ochiai is the best general-purpose choice, but Tarantula can outperform when failures are very sparse, and DStar amplifies signals when `n_ef` >> `n_ep`. The `compare` command lets users find the best formula for their data.
+
+**Self-check:** Can you explain why DStar(λ=2) amplifies differences between components more than Ochiai? Answer: DStar squares `n_ef` in the numerator, so the gap between a component with 8/10 failing executions and one with 3/10 failing execusions is dramatically larger in DStar than in Ochiai.
+
+### Concept 3: Personalized PageRank
+
+Standard PageRank simulates a random surfer who follows links with probability α (damping factor, 0.85) and teleports to a **random** node with probability 1-α.
+
+**Personalized PageRank** changes the teleportation: instead of teleporting uniformly, the surfer teleports according to a **personalization vector** — a probability distribution that biases certain nodes.
+
+In your case, the personalization vector = normalized spectrum scores. Services with high anomaly scores are "preferred" teleport destinations. This means the surfer spends more time near suspicious nodes, and the final scores reflect both graph centrality AND suspiciousness.
+
+**Mathematical formulation:**
+$$\mathbf{r} = \alpha \cdot \mathbf{M} \cdot \mathbf{r} + (1 - \alpha) \cdot \mathbf{p}$$
+
+Where:
+- **M** is the column-normalized adjacency matrix of the dependency graph
+- **p** is the personalization vector (Ochiai scores, normalized to sum to 1)
+- α is the damping factor (0.85)
+- **r** is the PageRank vector you're solving for
+
+**Why PageRank + spectrum scoring?** Because spectrum scoring alone can be misleading:
+- Service A is the root cause. Ochiai = 0.87.
+- Service B is downstream of A (B depends on A). Ochiai = 0.82 (almost as high — every trace that hits A also hits B).
+- Service C is upstream of A (A depends on C). Ochiai = 0.15 (unaffected).
+
+Ochiai alone ranks A slightly above B. But because the dependency graph has edges pointing FROM dependents TO dependencies (B→A means "B depends on A"), PageRank gives A high in-degree: B points to A, A points to C. With a low damping factor (α=0.30), the personalization vector (Ochiai scores) dominates, and A's structural position as a shared dependency gives it an extra boost from B's incoming rank. The result: A's lead over B widens, moving from a 0.05 margin (Ochiai-only) to a larger gap.
+
+**Critical: edge direction matters.** Edges must point FROM dependent TO dependency (B depends on A → edge B→A). If your input uses "calls" semantics (A calls B → edge A→B), reverse the edges before PageRank. Using call-direction edges causes PageRank to amplify victims (sinks with high in-degree from callers) instead of root causes. The library accepts depends-on edges by default and offers an `edge_semantics="calls"` parameter to auto-reverse.
+
+**Why not standard PageRank?** Standard PageRank (uniform personalization) would always rank the most-depended-on node #1 (e.g., database, authentication), regardless of anomaly. Personalization fixes this by biasing teleportation toward suspicious services.
+
+**Damping factor is lower (α=0.30 vs standard 0.85).** A high α lets graph structure overwhelm the anomaly signal — a service with zero anomalies but high in-degree can outrank the actual root cause. At α=0.30, ~70% of the final score comes from the anomaly signal (personalization) and ~30% from graph structure, striking the right balance for root cause analysis.
+
+**Self-check:** Can you explain, in your own words, what happens if the personalization vector sums to 4.7 instead of 1.0? Answer: PageRank will converge to wrong values — the probabilities won't sum to 1, breaking the random-surfer interpretation. Always normalize the vector.
+
+### Concept 4: Betweenness Centrality (Alternative Ranking)
+
+Betweenness centrality measures how often a node lies on the shortest path between two other nodes. A service with high betweenness is a "bridge" — if it fails, it disconnects parts of the graph.
+
+$$C_B(v) = \sum_{s \neq v \neq t} \frac{\sigma_{st}(v)}{\sigma_{st}}$$
+
+Where σ_st is the number of shortest paths from s to t, and σ_st(v) is the number of those paths that pass through v.
+
+**Why it's useful as a comparison:** If Betweenness ranks a service high but PageRank doesn't, that service is structurally important but not currently showing anomalous behavior. If PageRank ranks a service high but Betweenness doesn't, the anomaly signal is strong but the service isn't structurally central.
+
+**Self-check:** In a star graph (one hub connected to 10 leaves), which node has the highest betweenness? Answer: The hub — all paths between leaf nodes pass through it.
+
+## What to Study and Where
+
+| What | Where | What to Extract |
+|---|---|---|
+| Spectrum-based fault localization (SBFL) | [SBFL survey (IEEE)](https://ieeexplore.ieee.org/document/6907505) or Wikipedia on "Ochiai coefficient" | Ochiai, Tarantula, Jaccard, DStar formulas. Why Ochiai is the top performer in most studies. |
+| NetworkX PageRank | [NetworkX PageRank docs](https://networkx.org/documentation/stable/reference/algorithms/generated/networkx.algorithms.link_analysis.pagerank_alg.pagerank.html) | The `personalization` parameter: expects a dict mapping node → float, must sum to 1. `alpha`, `max_iter`, `tol` parameters. |
+| Betweenness centrality | [NetworkX betweenness](https://networkx.org/documentation/stable/reference/algorithms/generated/networkx.algorithms.centrality.betweenness_centrality.html) | The `weight` parameter. Use edge weights as call frequency. |
+| Python packaging | [Python Packaging Tutorial](https://packaging.python.org/tutorials/packaging-projects/) | How to create a pip-installable package with `pyproject.toml`. |
+| pytest | [pytest docs](https://docs.pytest.org/) | Writing parameterized tests for mathematical correctness. Test with known inputs → expected outputs. |
+
+## What to Code
+
+### Component 2.1: Core Spectrum Scorer
+
+**Purpose:** Compute suspiciousness scores for components given execution data, supporting four formulas.
+
+**Input:** List of `Execution` objects (each with `components: list[str]`, `is_failing: bool`, and optional `timestamp: float | None`)
+**Output:** Dictionary mapping `component_name → float` (score in range 0.0 to 1.0)
+
+**What to understand when coding this:**
+
+```python
+from dataclasses import dataclass
+from math import sqrt, exp, log
+
+@dataclass
+class Execution:
+    components: list[str]       # which components were involved
+    is_failing: bool            # whether this execution failed
+    timestamp: float | None = None  # unix timestamp or monotonically increasing ID
+                                     # earlier timestamps get higher weight in
+                                     # temporal mode (anomaly-onset ordering)
+
+class SpectrumScorer:
+    """Implements four SBFL formulas with optional temporal weighting."""
+
+    FORMULAS = {"ochiai", "tarantula", "jaccard", "dstar"}
+
+    def __init__(self, formula: str = "ochiai",
+                 temporal_half_life: float | None = None):
+        if formula not in self.FORMULAS:
+            raise ValueError(f"Unknown formula: {formula}")
+        self.formula = formula
+        self.temporal_half_life = temporal_half_life  # seconds, None = disabled
+
+    def score(self, executions: list[Execution]) -> dict[str, float]:
+        from collections import defaultdict
+
+        # Compute per-execution weights if temporal mode is enabled
+        has_timestamps = all(ex.timestamp is not None for ex in executions)
+        use_temporal = self.temporal_half_life is not None and has_timestamps
+
+        if use_temporal:
+            t_first = min(ex.timestamp for ex in executions)
+            weights = {}
+            for ex in executions:
+                dt = ex.timestamp - t_first
+                if dt <= 0:
+                    weights[id(ex)] = 1.0
+                else:
+                    # exponential decay: weight halves every half_life seconds
+                    weights[id(ex)] = 0.5 ** (dt / self.temporal_half_life)
+
+        n_ef = defaultdict(float)
+        n_ep = defaultdict(float)
+        n_f = 0.0
+
+        for ex in executions:
+            w = weights[id(ex)] if use_temporal else 1.0
+            if ex.is_failing:
+                n_f += w
+                for comp in ex.components:
+                    n_ef[comp] += w
+            else:
+                for comp in ex.components:
+                    n_ep[comp] += w
+
+        n_p = (sum(weights[id(ex)] for ex in executions) if use_temporal
+               else len(executions)) - n_f
+        components = set(n_ef.keys()) | set(n_ep.keys())
+
+        if n_f == 0:
+            return {c: 0.0 for c in components}
+
+        scores = {}
+        for comp in components:
+            ef = n_ef[comp]
+            ep = n_ep[comp]
+            n_e = ef + ep
+            n_nf = n_f - ef
+
+            if n_e == 0:
+                scores[comp] = 0.0
+                continue
+
+            if self.formula == "ochiai":
+                denom = sqrt(n_f * n_e)
+                scores[comp] = ef / denom if ef > 0 and denom > 0 else 0.0
+            elif self.formula == "tarantula":
+                fail_ratio = ef / n_f if n_f > 0 else 0
+                pass_ratio = ep / n_p if n_p > 0 else 0
+                denom = fail_ratio + pass_ratio
+                scores[comp] = fail_ratio / denom if denom > 0 else 0.0
+            elif self.formula == "jaccard":
+                denom = n_f + ep
+                scores[comp] = ef / denom if denom > 0 else 0.0
+            elif self.formula == "dstar":
+                denom = ep + n_nf
+                scores[comp] = (ef ** 2) / denom if denom > 0 else float(ef ** 2)
+
+        return dict(sorted(scores.items(), key=lambda x: x[1], reverse=True))
+```
+
+**Key edge cases:**
+- `n_f = 0`: no failing executions → all components score 0.0
+- `n_e = 0`: component never appeared → score 0.0
+- Tarantula denominator = 0: component appears in 0 failing AND 0 passing → return 0.0
+- DStar denominator = 0 (n_ep = 0 and n_nf = 0): component appears in ALL failing and NO passing → maximum suspiciousness, return `n_ef ** 2` as a finite large score
+- Temporal mode with all same timestamps: all weights = 1.0, identical to non-temporal mode
+- Temporal mode with some missing timestamps: falls back to non-temporal (unit weights) — a warning should be logged
+
+**How to verify it works:**
+- Test with the walk-through example from Concept 1: inventory = 0.868, frontend = 0.447
+- Test with component that appears only in failing executions → Ochiai = 1.0
+- Test with component that appears in all executions equally → Ochiai ≈ 0.5
+- Run all four formulas on same data → outputs should differ (DStar amplifies, Tarantula different shape)
+- Test DStar with component in ALL failing and NO passing → should return finite large score (n_ef²), not crash or return 0
+- Test temporal mode: component A appears in early failures (t=0), B in late failures (t=100) with half_life=50 → A should score higher than non-temporal baseline, B lower
+- Test temporal fallback: mixed timestamps (some None) → should use unit weights (non-temporal behavior)
+- Write parameterized pytest tests with known inputs → expected outputs
+
+### Component 2.2: Personalized PageRank Ranker
+
+**Purpose:** Run Personalized PageRank with anomaly scores as the personalization vector.
+
+**Input:** NetworkX `DiGraph`, anomaly scores dict (from SpectrumScorer), alpha (default 0.85)
+**Output:** List of `(node, score)` tuples, sorted descending
+
+**What to understand when coding this:**
+
+```python
+import networkx as nx
+
+class RootCauseRanker:
+    """Implements five ranking algorithms: Personalized PageRank, Upstream
+    Propagation, Standard PageRank, Betweenness Centrality, Anomaly-Only."""
+
+    def rank_pagerank(self, graph: nx.DiGraph,
+                      anomaly_scores: dict[str, float],
+                      alpha: float = 0.30,
+                      edge_semantics: str = "depends-on") -> list[tuple[str, float]]:
+        """Personalized PageRank with anomaly scores as personalization.
+
+        Args:
+            graph: Dependency graph. Edges should point FROM dependent TO
+                   dependency (B depends on A → edge B→A). Set
+                   edge_semantics='calls' if edges mean 'A calls B' (auto-reversed).
+            anomaly_scores: Dict mapping node → suspiciousness score [0..1].
+            alpha: Damping factor. Lower values (0.15-0.50) give more weight
+                   to anomaly scores vs graph structure. Default 0.30.
+        """
+        if edge_semantics == "calls":
+            graph = graph.reverse(copy=True)
+
+        total = sum(anomaly_scores.values())
+
+        if total == 0:
+            # No anomaly signal → fall back to uniform (standard PageRank)
+            personalization = None
+        else:
+            personalization = {
+                node: anomaly_scores.get(node, 0.0) / total
+                for node in graph.nodes()
+            }
+
+        ranked = nx.pagerank(
+            graph,
+            alpha=alpha,
+            personalization=personalization,
+            weight='weight',
+            max_iter=100,
+            tol=1e-06
+        )
+        return sorted(ranked.items(), key=lambda x: x[1], reverse=True)
+
+    def rank_standard_pagerank(self, graph: nx.DiGraph,
+                               alpha: float = 0.30) -> list[tuple[str, float]]:
+        """Standard PageRank — uniform personalization. Useful as baseline."""
+        ranked = nx.pagerank(graph, alpha=alpha, weight='weight', max_iter=100)
+        return sorted(ranked.items(), key=lambda x: x[1], reverse=True)
+
+    def rank_betweenness(self, graph: nx.DiGraph) -> list[tuple[str, float]]:
+        """Betweenness centrality — structural importance only."""
+        inverted = graph.copy()
+        for u, v, data in inverted.edges(data=True):
+            w = data.get('weight', 1.0)
+            data['distance'] = 1.0 / w if w > 0 else float('inf')
+        scores = nx.betweenness_centrality(inverted, weight='distance')
+        return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+    def rank_anomaly_only(self, anomaly_scores: dict[str, float]) -> list[tuple[str, float]]:
+        """Rank by anomaly score alone — no graph consideration."""
+        return sorted(anomaly_scores.items(), key=lambda x: x[1], reverse=True)
+
+    def rank_propagation(self, graph: nx.DiGraph,
+                         anomaly_scores: dict[str, float],
+                         decay: float = 0.80,
+                         edge_semantics: str = "depends-on") -> list[tuple[str, float]]:
+        """Propagate anomaly scores upstream along dependency edges.
+
+        If B depends on A (edge B→A) and B shows anomalies, A's score is
+        partially boosted — because A's failure would cause B's symptoms.
+        Uses topological order (leaves first) to propagate in one pass.
+        Simpler and more interpretable than PageRank for root cause analysis.
+
+        Args:
+            graph: Dependency graph (same semantics as rank_pagerank).
+            anomaly_scores: Ochiai/etc scores dict.
+            decay: Fraction of downstream anomaly that propagates upstream (0..1).
+            edge_semantics: 'depends-on' (default) or 'calls' (auto-reversed).
+        """
+        if edge_semantics == "calls":
+            graph = graph.reverse(copy=True)
+
+        scores = dict(anomaly_scores)
+        try:
+            order = list(nx.topological_sort(graph))
+        except nx.NetworkXUnfeasible:
+            # Graph has cycles — fall back to iterative propagation
+            order = list(graph.nodes())
+
+        for node in order:
+            for dep in graph.successors(node):  # node -> dep means node depends on dep
+                boost = scores[node] * decay
+                if boost > scores.get(dep, 0):
+                    scores[dep] = boost
+
+        return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+```
+
+**Key points:**
+- The personalization vector MUST include ALL nodes in the graph (use 0 for nodes with no anomaly score)
+- The personalization vector MUST sum to 1.0 (NetworkX requires this)
+- If all anomaly scores are 0, pass `personalization=None` for standard PageRank
+- Edge weights (call frequency) affect the link-following probability — higher weight edges are followed more often
+- **Edge semantics:** Default is "depends-on" (B→A means B depends on A). Set `edge_semantics="calls"` if your edges mean "A calls B" — the ranker auto-reverses them so PageRank works correctly.
+- **Damping factor:** Default α=0.30 (not 0.85). This gives ~70% weight to anomaly signal and ~30% to graph structure — the right balance for root cause analysis.
+
+**How to verify it works:**
+- Create simple graph: A depends on B (A→B). A's anomaly = 0.9, B and C = 0.1. B should rank #1 because A's anomaly propagates upstream to B.
+- Create graph where A and B have equal anomaly scores but B depends on A (B→A) → A should rank higher
+- Compare with `rank_standard_pagerank` → should rank most-connected node #1 (most-depended-on service)
+- Compare with `rank_anomaly_only` → should ignore graph structure entirely
+- Compare with `rank_betweenness` → should rank bridge nodes highest; verify that a high-weight edge (many calls) makes its endpoints MORE central, not less (catches weight inversion bugs)
+- Compare with `rank_propagation` → should produce similar but simpler results to rank_pagerank on acyclic graphs
+- Test with `edge_semantics="calls"` vs `edge_semantics="depends-on"` on the same graph → rankings should differ (auto-reversal)
+
+### Component 2.3: Algorithm Comparator
+
+**Purpose:** Run all formula × algorithm combinations and produce comparison output.
+
+**Input:** Execution data, dependency graph
+**Output:** Comparison table showing ranking from each combination
+
+**What to understand when coding this:**
+
+```python
+def compare(graph: nx.DiGraph, executions: list[Execution]) -> dict:
+    results = {}
+    formulas = ["ochiai", "tarantula", "jaccard", "dstar"]
+
+    for formula in formulas:
+        scorer = SpectrumScorer(formula=formula)
+        scores = scorer.score(executions)
+
+        ranker = RootCauseRanker()
+        results[f"{formula}_pagerank"] = ranker.rank_pagerank(graph, scores)
+        results[f"{formula}_propagation"] = ranker.rank_propagation(graph, scores)
+        results[f"{formula}_anomaly_only"] = ranker.rank_anomaly_only(scores)
+
+    # Also add graph-only methods
+    ranker = RootCauseRanker()
+    results["standard_pagerank"] = ranker.rank_standard_pagerank(graph)
+    results["betweenness"] = ranker.rank_betweenness(graph)
+
+    return results
+```
+
+**How to verify it works:**
+- Run on the same data — different formulas should produce different ranked lists
+- The `ochiai_pagerank` combination should produce the most reliable ranking (this is the MicroRank paper's finding)
+
+### Component 2.4: Pipeline Orchestrator (MicroRank v1)
+
+**Purpose:** Tie scoring and ranking together into a single `analyze()` call.
+
+**Input:** Execution data (pass/fail + component lists), dependency graph
+**Output:** Ranked list of `(component, score)` with metadata
+
+**What to understand when coding this:**
+
+```python
+@dataclass
+class AnalysisResult:
+    ranked: list[tuple[str, float]]
+    formula_used: str
+    algorithm_used: str
+    component_scores: dict[str, float]  # raw spectrum scores before PageRank
+
+def analyze(graph: nx.DiGraph,
+            executions: list[Execution],
+            formula: str = "ochiai",
+            algorithm: str = "propagation") -> AnalysisResult:
+    scorer = SpectrumScorer(formula=formula)
+    scores = scorer.score(executions)
+
+    ranker = RootCauseRanker()
+    if algorithm == "propagation":
+        ranked = ranker.rank_propagation(graph, scores)
+    elif algorithm == "pagerank":
+        ranked = ranker.rank_pagerank(graph, scores)
+    elif algorithm == "anomaly_only":
+        ranked = ranker.rank_anomaly_only(scores)
+    else:
+        raise ValueError(f"Unknown algorithm: {algorithm}")
+
+    return AnalysisResult(
+        ranked=ranked,
+        formula_used=formula,
+        algorithm_used=algorithm,
+        component_scores=scores
+    )
+```
+
+### Component 2.5: Iterative Root Cause Removal
+
+**Purpose:** When multiple independent root causes fail simultaneously, single-pass analysis may miss secondary causes (the dominant root cause suppresses others). This component iteratively removes the top-ranked cause and re-analyzes, peeling back layers.
+
+**Input:** Same as `analyze()` + `max_candidates: int` (default 3)
+**Output:** List of `AnalysisResult`, one per discovered root cause
+
+**What to understand when coding this:**
+
+```python
+from copy import deepcopy
+
+def iterative_analyze(graph: nx.DiGraph,
+                      executions: list[Execution],
+                      formula: str = "ochiai",
+                      algorithm: str = "propagation",
+                      max_candidates: int = 3,
+                      score_threshold: float = 0.0,
+                      temporal_half_life: float | None = None
+                      ) -> list[AnalysisResult]:
+    """Find root causes iteratively, removing each after discovery.
+
+    After finding the top candidate:
+    1. Record it as a root cause with its score and sub-ranking
+    2. Remove all executions containing that component (they are "explained" by it)
+    3. Remove the component from the graph
+    4. Re-run analysis on remaining executions + graph
+    5. Stop when no failing executions remain or max_candidates is reached
+
+    Args:
+        score_threshold: Stop if the top candidate's score falls below this.
+        temporal_half_life: Passed through to SpectrumScorer for temporal mode.
+    """
+    results: list[AnalysisResult] = []
+    remaining_execs = list(executions)
+    remaining_graph = graph.copy()
+
+    for _ in range(max_candidates):
+        if not any(ex.is_failing for ex in remaining_execs):
+            break  # no more failures to explain
+
+        scorer = SpectrumScorer(
+            formula=formula,
+            temporal_half_life=temporal_half_life
+        )
+        scores = scorer.score(remaining_execs)
+        if not scores:
+            break
+
+        ranker = RootCauseRanker()
+        if algorithm == "propagation":
+            ranked = ranker.rank_propagation(remaining_graph, scores)
+        elif algorithm == "pagerank":
+            ranked = ranker.rank_pagerank(remaining_graph, scores)
+        else:
+            ranked = ranker.rank_anomaly_only(scores)
+
+        if not ranked:
+            break
+
+        top_name, top_score = ranked[0]
+        if top_score < score_threshold:
+            break  # remaining scores too low to be meaningful
+
+        results.append(AnalysisResult(
+            ranked=ranked,
+            formula_used=formula,
+            algorithm_used=algorithm,
+            component_scores=scores
+        ))
+
+        # Remove explained executions (those containing the top component)
+        remaining_execs = [
+            ex for ex in remaining_execs
+            if top_name not in ex.components
+        ]
+
+        # Remove the component from the graph
+        if top_name in remaining_graph:
+            remaining_graph.remove_node(top_name)
+
+    return results
+```
+
+**Key points:**
+- Each iteration removes the top component from BOTH the graph and the execution list
+- Removing executions containing the root cause prevents it from suppressing other causes' signals
+- `score_threshold` prevents returning low-confidence noise as root causes
+- The returned list preserves the discovery order (most impactful first)
+- Works with any scoring formula + ranking algorithm combination
+
+**How to verify it works:**
+- Two independent root causes A and D: A affects B/C, D affects E/F. First iteration finds A (removes B/C executions), second finds D
+- Single root cause: second iteration immediately stops (no failing executions remain)
+- Score threshold: set threshold above the highest Ochiai score → returns empty list
+- Graph removal: third iteration on a 2-cause problem stops because graph has no nodes with failing executions
+```
+
+### Component 2.6: CLI Interface
+
+**Purpose:** Command-line interface for scoring, ranking, and comparing.
+
+**Commands:**
+```bash
+# Score from JSON execution data (with optional temporal weighting)
+microrank score --input executions.json --formula ochiai
+microrank score --input executions.json --formula ochiai --temporal-half-life 120
+
+# Rank from graph and scores (choose algorithm: pagerank|propagation|betweenness|anomaly_only)
+microrank rank --graph graph.json --scores scores.json --algorithm propagation
+microrank rank --graph graph.json --scores scores.json --algorithm pagerank --alpha 0.30
+
+# Full analysis: score + rank in one step (defaults: ochiai + propagation)
+microrank analyze --graph graph.json --executions executions.json --formula ochiai
+
+# Iterative root cause removal (finds multiple independent root causes)
+microrank analyze --graph graph.json --executions executions.json --iterative --max-candidates 5
+
+# Compare all formula × algorithm combinations
+microrank compare --graph graph.json --executions executions.json
+
+# Specify edge semantics if graph uses "calls" convention
+microrank analyze --graph graph.json --executions executions.json --edge-semantics calls
+
+# Output as JSON
+microrank analyze --graph graph.json --executions executions.json --output results.json
+```
+
+**Input format (JSON):**
+```json
+{
+  "executions": [
+    {"components": ["frontend", "cart-service", "database"], "is_failing": true, "timestamp": 1000.0},
+    {"components": ["frontend", "cart-service"], "is_failing": false, "timestamp": 1005.0},
+    {"components": ["frontend", "payment-service"], "is_failing": true, "timestamp": 1200.0}
+  ]
+}
+```
+Timestamps are optional. When provided with `--temporal-half-life`, earlier executions get exponentially higher weight (anomaly-onset ordering). If timestamps are omitted or mixed (some None), temporal mode falls back to uniform weighting.
+
+**Graph format (JSON):**
+```json
+{
+  "nodes": ["frontend", "cart-service", "database", "payment-service"],
+  "edges": [
+    {"source": "frontend", "target": "cart-service", "weight": 95},
+    {"source": "cart-service", "target": "database", "weight": 85},
+    {"source": "frontend", "target": "payment-service", "weight": 60}
+  ]
+}
+```
+Edge semantics: `source → target` means `source` depends on `target` (e.g., frontend depends on cart-service). This is also the same direction as "source calls target" in microservice architectures. The library's default `edge_semantics="depends-on"` uses this convention — PageRank correctly amplifies dependencies (shared backend services) over dependents (frontend callers).
+
+**Library API:**
+```python
+from microrank import SpectrumScorer, RootCauseRanker, analyze, iterative_analyze
+
+scorer = SpectrumScorer(formula="ochiai")
+scores = scorer.score(executions)
+
+# With temporal weighting: earlier failures weighted higher
+scorer_t = SpectrumScorer(formula="ochiai", temporal_half_life=120)
+scores_t = scorer_t.score(executions)
+
+ranker = RootCauseRanker()
+ranked = ranker.rank_pagerank(graph, scores, alpha=0.30)  # low alpha for root cause analysis
+
+result = analyze(graph, executions, formula="ochiai", algorithm="propagation")
+print(result.ranked[:5])  # top 5 root cause candidates
+
+# Iterative: discover multiple independent root causes
+causes = iterative_analyze(graph, executions, max_candidates=5)
+for i, cause in enumerate(causes):
+    print(f"Cause #{i+1}: {cause.ranked[0]}")
+```
+
+## How the Pieces Connect
+
+```
+Execution Data (JSON)          Dependency Graph (JSON)
+         │                              │
+         ▼                              │
+┌─────────────────┐                     │
+│ Spectrum Scorer │ ←── Computes        │
+│ (Component 2.1) │     Ochiai/         │
+│                 │     Tarantula/      │
+│ 4 SBFL formulas │     Jaccard/DStar   │
+└────────┬────────┘                     │
+         │                              │
+         ▼                              ▼
+┌──────────────────────────────────────────┐
+│ RootCauseRanker (Component 2.2)          │
+│                                          │
+│  rank_pagerank()        ←── Personalizes │
+│  rank_standard_pagerank()   PageRank with│
+│  rank_betweenness()         anomaly      │
+│  rank_anomaly_only()        scores       │
+└────────┬─────────────────────────────────┘
+         │
+    ┌────┴────────────┐
+    ▼                 ▼
+┌────────────┐  ┌──────────────────┐
+│ Ranked List │  │ Comparator       │
+│ (sorted)    │  │ (Component 2.3)  │
+│             │  │ runs all combos  │
+└────────────┘  └──────────────────┘
+```
+
+## Understanding Checkpoints
+
+1. "Can I compute the Ochiai score by hand for a small set of 5 executions?" — If no, you don't understand the formula. Work through the walk-through in Concept 1.
+2. "Can I explain why Ochiai outperforms Tarantula when the frontend is in every execution?" — Answer: Ochiai's denominator (`sqrt(n_f × n_e)`) penalizes ubiquitous components more heavily than Tarantula's ratio.
+3. "Do all four formulas produce correct results for known test cases?" — If no, check your counting logic for `n_ef`, `n_ep`, `n_nf`, `n_f`, `n_p`.
+4. "Can I explain why the personalization vector must sum to 1?" — Answer: It's a probability distribution. If the entries don't sum to 1, the PageRank iteration doesn't produce valid probabilities, and the random-surfer interpretation breaks.
+5. "Can I predict the ranking for a simple 3-node graph with given anomaly scores?" — If no, trace through the PageRank iteration by hand for 2-3 iterations.
+6. "Do the four ranking algorithms produce different results on a test graph?" — If no, your graph or anomaly scores might not have enough variation. Try a graph where the most-central node (highest degree) has low anomaly and a peripheral node has high anomaly.
+7. "Does betweenness centrality rank a heavily-called edge's endpoints higher than a rarely-called edge's?" — If not, your weights are being treated as distances instead of frequencies. NetworkX inverts the semantics — you must pre-invert weights (`1/weight`) before passing them.
+8. "If I use call-direction edges (A→B means A calls B) without setting edge_semantics='calls', what happens?" — Answer: PageRank will amplify downstream victims (high in-degree in call graphs) instead of upstream root causes. The ranking will be inverted. Always use depends-on edges or set the flag.
+9. "What happens if I use α=0.85 instead of the default 0.30?" — Answer: The graph structure overwhelms the anomaly signal. A highly-depended-on service with zero anomalies can outrank the actual root cause. The standard 0.85 is tuned for web graphs, not root cause analysis.
+10. "Does temporal mode with half_life=60 give higher weight to earlier or later failures?" — Answer: Earlier failures get higher weight (closer to 1.0). A failure at t=0 gets weight 1.0, at t=60 gets 0.5, at t=120 gets 0.25. This captures anomaly-onset ordering: the service that failed first is more likely the root cause.
+11. "If I have 3 independent root causes, how many iterations does iterative_analyze run?" — Answer: It stops after 3 iterations (or when no failing executions remain). Each iteration removes the top candidate's executions, so the second and third causes get clean signals without the first cause's interference.
+12. "What happens if iterative_analyze's score_threshold is too high?" — Answer: It returns an empty list — even the top cause scores below the threshold. Set threshold to 0.0 to disable filtering.
+
+## Common Mistakes
+
+1. **Not handling division by zero.** If `n_f = 0` (no failing executions), all formulas are undefined. Return 0 for all components. If `n_e = 0` (component never appeared), return 0.
+2. **Confusing `n_ef` with `n_ep`.** `n_ef` = failing executions containing the component. `n_ep` = passing executions containing the component. Getting these backwards inverts the results.
+3. **Not including all graph nodes in the personalization vector.** NetworkX requires every node to have an entry — use 0 for nodes with no anomaly score.
+4. **Not normalizing the personalization vector to sum to 1.** If the Ochiai scores sum to 4.7, using them directly as `personalization` produces wrong PageRank results silently. NetworkX won't error — it'll just be wrong.
+5. **Using the wrong edge direction in the graph.** Edges must point FROM dependent TO dependency (B→A means B depends on A). If edges represent "A calls B" (A→B), set `edge_semantics="calls"` so the library auto-reverses them. Call-direction edges cause PageRank to amplify victims (sinks) instead of root causes.
+6. **Not handling Tarantula's denominator.** Tarantula's denominator (`fail_ratio + pass_ratio`) can be 0 if a component appears in 0 failing and 0 passing executions. Return 0.0.
+7. **Not inverting weights for Betweenness Centrality.** NetworkX `betweenness_centrality` treats edge weights as **distances** (lower = shorter = preferred). In a dependency graph, higher weight = more calls = stronger connection — the opposite. You must invert weights (`distance = 1/weight`) before passing them, or betweenness will favor weakly-connected edges over strongly-connected ones.
+8. **Using call-direction edges for PageRank.** If edges represent "A calls B" (A→B), PageRank amplifies B (the victim/sink) because high in-degree = high PageRank. Root causes typically have high OUT-degree in call graphs. Edges must be FROM dependent TO dependency (depends-on semantics), or the library's `edge_semantics="calls"` parameter must be set to trigger auto-reversal.
+9. **Using α=0.85 for root cause analysis.** Standard PageRank uses α=0.85, which means 85% of the score comes from the graph and only 15% from the anomaly signal. For root cause analysis, the anomaly signal should dominate — the graph should only provide a secondary adjustment. Use α=0.15-0.50 (default: 0.30).
+10. **Using temporal_half_life without timestamps.** If executions don't have timestamp fields, temporal weighting silently falls back to uniform weights. The result is correct but the user may think temporal mode is active when it isn't. Always verify timestamps are present before enabling temporal mode.
+11. **Not using iterative mode for multi-cause scenarios.** If two independent services fail simultaneously (e.g., database down AND payment-gateway outage), single-pass analysis may find only the strongest signal. Use `iterative_analyze()` or the `--iterative` CLI flag to discover secondary root causes.
+
+## Ship Criteria
+
+- [ ] Implements Ochiai, Tarantula, Jaccard, and DStar formulas
+- [ ] Implements Personalized PageRank, Upstream Propagation, standard PageRank, Betweenness Centrality, Anomaly-Only ranking
+- [ ] `compare` command that runs all formula × algorithm combinations
+- [ ] `analyze` command for single-step scoring + ranking
+- [ ] `iterative_analyze` for discovering multiple independent root causes
+- [ ] Temporal weighting via `temporal_half_life` parameter (earlier failures weighted higher)
+- [ ] Optional `timestamp` field on Execution objects for anomaly-onset ordering
+- [ ] Clean Python library API with `SpectrumScorer` and `RootCauseRanker` classes
+- [ ] JSON input/output for both execution data and dependency graphs
+- [ ] Comprehensive test suite with known inputs and expected outputs
+- [ ] pip-installable (`pip install microrank`)
+- [ ] README with formula explanations, algorithm descriptions, and usage examples
+- [ ] Works on any graph + execution data (not just microservices — any SBFL domain)
+- [ ] Graceful handling of edge cases (zero failures, zero appearances, empty graphs)
