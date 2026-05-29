@@ -23,6 +23,23 @@ RootRank answers a single question: **"Which node in my dependency graph is the 
 pip install rootrank
 ```
 
+### Step-by-step: what you need and what to do
+
+**Step 1 — Get your traces.**  
+Every time a request hits your system, it touches several services. Your tracing tool (Jaeger, Datadog, Zipkin, AWS X-Ray, or just plain logs) records which services were called and whether the request succeeded or failed. Export that list.
+
+**Step 2 — Get your graph.**  
+Your system has a map of "who calls who." Frontend calls checkout. Checkout calls payment. Every ops team knows this — from their service mesh (Istio/Linkitel), API gateway config, or an architecture diagram. List it out.
+
+**Step 3 — Put them in JSON.**  
+Format both as shown below. Takes 2 minutes.
+
+**Step 4 — Run RootRank.**  
+```bash
+RootRank analyze --graph graph.json --executions executions.json
+```
+It prints a ranked list. The #1 entry is your most likely root cause. Go fix it.
+
 ```bash
 # Score services by suspiciousness
 RootRank score --input executions.json --formula ochiai
