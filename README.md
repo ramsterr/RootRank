@@ -19,45 +19,62 @@ RootRank answers a single question: **"Which node in my dependency graph is the 
 
 ## Quickstart
 
+### 1. Clone and install
+
 ```bash
-pip install rootrank
+git clone https://github.com/ramsterr/RootRank.git
+cd RootRank
+pip install -e ".[dev]"
 ```
 
-### Step-by-step: what you need and what to do
+### 2. Create your input files
 
-**Step 1 — Get your traces.**  
-Every time a request hits your system, it touches several services. Your tracing tool (Jaeger, Datadog, Zipkin, AWS X-Ray, or just plain logs) records which services were called and whether the request succeeded or failed. Export that list.
+**`executions.json`** — pass/fail traces. Each trace lists which components were hit and whether the request succeeded or failed. Timestamps are optional (include them to enable temporal weighting).
 
-**Step 2 — Get your graph.**  
-Your system has a map of "who calls who." Frontend calls checkout. Checkout calls payment. Every ops team knows this — from their service mesh (Istio/Linkitel), API gateway config, or an architecture diagram. List it out.
-
-**Step 3 — Put them in JSON.**  
-Format both as shown below. Takes 2 minutes.
-
-**Step 4 — Run RootRank.**  
-```bash
-RootRank analyze --graph graph.json --executions executions.json
+```json
+{
+  "executions": [
+    {"components": ["frontend", "cart-service", "database"], "is_failing": true, "timestamp": 0.0},
+    {"components": ["frontend", "cart-service", "database"], "is_failing": true, "timestamp": 10.0},
+    {"components": ["frontend", "cart-service"], "is_failing": false, "timestamp": 100.0},
+    {"components": ["frontend", "payment-service"], "is_failing": false, "timestamp": 110.0}
+  ]
+}
 ```
-It prints a ranked list. The #1 entry is your most likely root cause. Go fix it.
+
+**`graph.json`** — dependency graph. Edge semantics: `source → target` means *source depends on target* (same direction as "source calls target" in microservice architectures).
+
+```json
+{
+  "nodes": ["frontend", "cart-service", "database", "payment-service"],
+  "edges": [
+    {"source": "frontend", "target": "cart-service", "weight": 95},
+    {"source": "cart-service", "target": "database", "weight": 85},
+    {"source": "frontend", "target": "payment-service", "weight": 60}
+  ]
+}
+```
+
+### 3. Run the analysis
 
 ```bash
-# Score services by suspiciousness
-RootRank score --input executions.json --formula ochiai
+# One-line analysis (score + rank)
+python -m rootrank.cli analyze --graph graph.json --executions executions.json
+
+# Score services by suspiciousness only
+python -m rootrank.cli score --input executions.json --formula ochiai
 
 # Rank using graph structure
-RootRank rank --graph graph.json --scores scores.json --algorithm propagation
-
-# One-line analysis (score + rank)
-RootRank analyze --graph graph.json --executions executions.json
+python -m rootrank.cli rank --graph graph.json --scores scores.json --algorithm propagation
 
 # Find multiple independent root causes
-RootRank analyze --graph graph.json --executions executions.json --iterative
+python -m rootrank.cli analyze --graph graph.json --executions executions.json --iterative
 
 # Compare all 14 formula × algorithm combinations
-RootRank compare --graph graph.json --executions executions.json --output results.json
+python -m rootrank.cli compare --graph graph.json --executions executions.json --output results.json
 ```
 
-### Python API
+### 4. Python API
 
 ```python
 from rootrank import analyze, iterative_analyze, compare, SpectrumScorer, RootCauseRanker
@@ -200,14 +217,14 @@ Edge semantics: `source → target` means *source depends on target*. This is th
 
 ## Design Principles
 
-- **Zero runtime dependencies beyond NetworkX** — works anywhere Python runs
+- **Minimal dependencies** — only NetworkX and SciPy
 - **Single-pass O(E) scoring** — not O(C×E)
 - **All division-by-zero paths** guarded
 - **Weights inverted for betweenness** — NetworkX treats weights as distances by default (a common footgun)
 - **Low PageRank α (0.30)** — standard 0.85 drowns the anomaly signal in graph structure
 - **Depends-on edge semantics by default** — prevents the "victim amplification" bug
 
-## Install from Source
+## Development
 
 ```bash
 git clone https://github.com/ramsterr/RootRank.git
